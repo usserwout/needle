@@ -1,0 +1,227 @@
+{
+  "examples": 32,
+  "exact_call_accuracy": 0.21875,
+  "exact_call_ci95": [
+    0.0625,
+    0.40625
+  ],
+  "tool_selection_accuracy": 0.25,
+  "argument_exact_match": 0.3333333333333333,
+  "hallucinated_argument_rate": 0.10714285714285714,
+  "no_call": {
+    "precision": 0.35714285714285715,
+    "recall": 0.625,
+    "f1": 0.45454545454545453
+  },
+  "multi_call_exact_match": 0.125,
+  "slices": {
+    "task_family": {
+      "action": {
+        "examples": 8,
+        "exact_call_accuracy": 0.0
+      },
+      "extraction": {
+        "examples": 8,
+        "exact_call_accuracy": 0.125
+      },
+      "multi_call": {
+        "examples": 8,
+        "exact_call_accuracy": 0.125
+      },
+      "negative": {
+        "examples": 8,
+        "exact_call_accuracy": 0.625
+      }
+    },
+    "locale": {
+      "nl-BE": {
+        "examples": 4,
+        "exact_call_accuracy": 0.5
+      },
+      "nl-NL": {
+        "examples": 28,
+        "exact_call_accuracy": 0.17857142857142858
+      }
+    },
+    "source": {
+      "MASSIVE-1.0-CC-BY-4.0": {
+        "examples": 8,
+        "exact_call_accuracy": 0.0
+      },
+      "deterministic-dutch-extraction-v1": {
+        "examples": 8,
+        "exact_call_accuracy": 0.125
+      },
+      "deterministic-dutch-multi-v1": {
+        "examples": 8,
+        "exact_call_accuracy": 0.125
+      },
+      "deterministic-dutch-negative-v1": {
+        "examples": 8,
+        "exact_call_accuracy": 0.625
+      }
+    },
+    "domain": {
+      "extraction": {
+        "examples": 8,
+        "exact_call_accuracy": 0.125
+      },
+      "general": {
+        "examples": 1,
+        "exact_call_accuracy": 0.0
+      },
+      "home": {
+        "examples": 2,
+        "exact_call_accuracy": 0.0
+      },
+      "iot": {
+        "examples": 5,
+        "exact_call_accuracy": 0.0
+      },
+      "negative": {
+        "examples": 8,
+        "exact_call_accuracy": 0.625
+      },
+      "productivity": {
+        "examples": 2,
+        "exact_call_accuracy": 0.0
+      },
+      "scheduling": {
+        "examples": 2,
+        "exact_call_accuracy": 0.0
+      },
+      "takeaway": {
+        "examples": 2,
+        "exact_call_accuracy": 0.0
+      },
+      "time": {
+        "examples": 2,
+        "exact_call_accuracy": 0.5
+      }
+    },
+    "extraction_type": {
+      "extract_appointment": {
+        "examples": 1,
+        "exact_call_accuracy": 0.0
+      },
+      "extract_citation": {
+        "examples": 1,
+        "exact_call_accuracy": 0.0
+      },
+      "extract_contact": {
+        "examples": 1,
+        "exact_call_accuracy": 0.0
+      },
+      "extract_form": {
+        "examples": 1,
+        "exact_call_accuracy": 1.0
+      },
+      "extract_invoice": {
+        "examples": 1,
+        "exact_call_accuracy": 0.0
+      },
+      "extract_order": {
+        "examples": 1,
+        "exact_call_accuracy": 0.0
+      },
+      "extract_product": {
+        "examples": 1,
+        "exact_call_accuracy": 0.0
+      },
+      "extract_shipment": {
+        "examples": 1,
+        "exact_call_accuracy": 0.0
+      },
+      "unspecified": {
+        "examples": 24,
+        "exact_call_accuracy": 0.25
+      }
+    },
+    "tool_similarity": {
+      "mixed_workflow_actions": {
+        "examples": 8,
+        "exact_call_accuracy": 0.125
+      },
+      "same_record_shape": {
+        "examples": 8,
+        "exact_call_accuracy": 0.125
+      },
+      "same_scenario": {
+        "examples": 8,
+        "exact_call_accuracy": 0.0
+      },
+      "unrelated": {
+        "examples": 8,
+        "exact_call_accuracy": 0.625
+      }
+    },
+    "schema_variant": {
+      "0": {
+        "examples": 16,
+        "exact_call_accuracy": 0.1875
+      },
+      "1": {
+        "examples": 16,
+        "exact_call_accuracy": 0.25
+      }
+    },
+    "query_length": {
+      "long": {
+        "examples": 5,
+        "exact_call_accuracy": 0.2
+      },
+      "medium": {
+        "examples": 23,
+        "exact_call_accuracy": 0.2608695652173913
+      },
+      "short": {
+        "examples": 4,
+        "exact_call_accuracy": 0.0
+      }
+    },
+    "noise": {
+      "clean": {
+        "examples": 32,
+        "exact_call_accuracy": 0.21875
+      }
+    }
+  },
+  "weights": "/tmp/needle-dutch-smoke/retry-final.cact",
+  "dataset": "/tmp/needle-dutch-smoke/val-balanced1024.jsonl",
+  "unique_tool_catalogues": 29,
+  "invalid_generated_calls": 5,
+  "all_generated_calls_schema_valid": false,
+  "invalid_call_examples": [
+    {
+      "id": "massive:17",
+      "errors": [
+        "argument 'device_type' is not grounded in query",
+        "argument 'change_amount' is not grounded in query"
+      ]
+    },
+    {
+      "id": "extraction:val:1000000",
+      "errors": [
+        "argument 'email' is not grounded in query"
+      ]
+    },
+    {
+      "id": "negative:val:1000004",
+      "errors": [
+        "argument 'availability' is not grounded in query"
+      ]
+    },
+    {
+      "id": "negative:val:1000006",
+      "errors": [
+        "argument 'year' is not grounded in query"
+      ]
+    },
+    {
+      "id": "multi:val:1000005",
+      "errors": [
+        "argument 'state' is not grounded in query"
+      ]
+    }
+  ]
+}

@@ -24,7 +24,8 @@ metal = [
     "jaxlib==0.4.38",
     "jax-metal"
 ]
-test = ["pytest", "pydantic"]
+test = ["pytest", "pydantic", "pypdf"]
+invoice = ["pydantic", "pypdf"]
 
 [project.scripts]
 needle = "needle.cli:main"

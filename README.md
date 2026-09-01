@@ -68,6 +68,17 @@ invoice = needle.extract("Invoice from Acme Corp, $1,200.00, due 2026-09-01", In
 print(invoice.vendor, invoice.total)   # -> Acme Corp 1200.0
 ```
 
+### Invoice PDFs
+
+The repository includes `invoice_extractor.py` for extracting the issuing company and final payable total from a text-based invoice PDF:
+
+```bash
+pip install -e '.[invoice]'
+python invoice_extractor.py "/path/to/invoice.pdf"
+```
+
+For scanned PDFs, run OCR first; `pypdf` can extract selectable PDF text but does not perform OCR.
+
 Per argument descriptions and choices, value constraints compiled into the decode grammar, raw JSON schemas, driving the loop with `complete()`, the response contract, system facts, tool retrieval, and confidence gating are all covered in [doc/apis.md](doc/apis.md).
 
 ## Playground

@@ -8,6 +8,10 @@ HELP = """usage: needle <command> [options]
 
   run            run a checkpoint on a query
   finetune       train a LoRA adapter on JSONL data
+  dutch-data     build the complete Dutch corpus (MASSIVE + augmentation)
+  validate-data  validate Needle JSONL examples before training
+  evaluate       run an engine-backed semantic call evaluation
+  release-check  enforce Dutch quality and quantization release gates
   generate-data  synthesise training data via OpenRouter
   build          export a checkpoint to a .cact archive
   download       download weights or an engine build
@@ -130,6 +134,10 @@ def main():
 
     p = sub.add_parser("finetune")
     p.add_argument("jsonl_path", type=str, help="Path to JSONL training data")
+    p.add_argument("--train-file", type=str, default=None,
+                   help="Explicit training JSONL (overrides positional jsonl_path)")
+    p.add_argument("--val-file", type=str, default=None,
+                   help="Explicit validation JSONL; recommended for grouped splits")
     p.add_argument("--checkpoint", type=str, default=None,
                    help="Base model checkpoint (auto-downloads from HuggingFace if omitted)")
     p.add_argument("--epochs", type=int, default=3)
@@ -140,6 +148,22 @@ def main():
     p.add_argument("--max-len", type=int, default=1024, help="Max training sequence length")
     p.add_argument("--val-split", type=float, default=0.1,
                    help="Fraction of examples held out for validation (0 disables)")
+    p.add_argument("--seed", type=int, default=0, help="Training/data-order seed")
+    p.add_argument("--max-steps", type=int, default=0,
+                   help="Stop after this many optimizer updates (0 uses epochs)")
+    p.add_argument("--grad-accum-steps", type=int, default=1,
+                   help="Accumulate this many microbatches per optimizer update")
+    p.add_argument("--eval-every", type=int, default=0,
+                   help="Evaluate every N optimizer updates (0 evaluates each epoch)")
+    p.add_argument("--early-stopping-patience", type=int, default=0,
+                   help="Stop after N non-improving validations (0 disables)")
+    p.add_argument("--selection-metric", choices=["runtime_exact", "val_loss"],
+                   default="val_loss",
+                   help="Checkpoint selection metric; runtime_exact uses deployed engine calls")
+    p.add_argument("--resume", type=str, default=None,
+                   help="Resume a saved training-state checkpoint")
+    p.add_argument("--fail-on-truncation", action="store_true",
+                   help="Reject examples whose rendered sequence exceeds --max-len")
     p.add_argument("--generate", type=int, default=0,
                    help="Generate N extra examples via OpenRouter before training (0 = off)")
     p.add_argument("--model", type=str, default="deepseek/deepseek-v4-flash",
@@ -148,6 +172,57 @@ def main():
                    help="Concurrent OpenRouter requests when generating (default: 8)")
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--out", type=str, default=None, help="Output adapter path (.pkl)")
+
+    p = sub.add_parser("dutch-data")
+    p.add_argument("--input", "--massive", dest="massive",
+                   default="data/raw/1.0/data/nl-NL.jsonl",
+                   help="MASSIVE Dutch JSONL (default: data/raw/1.0/data/nl-NL.jsonl)")
+    p.add_argument("--input-en", "--massive-en", dest="massive_en",
+                   default="data/raw/1.0/data/en-US.jsonl",
+                   help="MASSIVE English JSONL (default: data/raw/1.0/data/en-US.jsonl)")
+    p.add_argument("--output", "--output-dir", dest="output_dir", default="data/dutch",
+                   help="Output directory (default: data/dutch)")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--action-count", type=int, default=8000)
+    p.add_argument("--extraction-count", type=int, default=2000)
+    p.add_argument("--negative-count", type=int, default=1200)
+    p.add_argument("--multi-count", type=int, default=600)
+    p.add_argument("--english-count", type=int, default=1200)
+    p.add_argument("--augmentation-count", type=int, default=20000,
+                   help="Additional varied Dutch records (default: 20000; 0 disables)")
+
+    p = sub.add_parser("dutch-augment")
+    p.add_argument("--input", required=True, help="Existing Needle training JSONL")
+    p.add_argument("--output", required=True, help="Output JSONL containing base + generated examples")
+    p.add_argument("--count", type=int, default=20000,
+                   help="Number of additional deterministic Dutch examples (default: 20000)")
+    p.add_argument("--seed", type=int, default=0)
+
+    p = sub.add_parser("validate-data")
+    p.add_argument("jsonl_paths", nargs="+", help="One or more Needle JSONL split files to validate")
+    p.add_argument("--require-grounding", action="store_true",
+                   help="Require every string argument to occur in its query")
+    p.add_argument("--report", default=None, help="Write validation report JSON")
+    p.add_argument("--max-len", type=int, default=0,
+                   help="Also report rendered token lengths (0 disables tokenization)")
+    p.add_argument("--fail-on-truncation", action="store_true",
+                   help="Exit non-zero if rendered examples exceed --max-len")
+
+    p = sub.add_parser("evaluate")
+    p.add_argument("jsonl_path", help="Frozen JSONL evaluation data")
+    p.add_argument("--weights", default=None, help="Optional tuned .cact archive")
+    p.add_argument("--report", default=None, help="Write report JSON")
+    p.add_argument("--limit", type=int, default=0, help="Evaluate first N examples (0 = all)")
+    p.add_argument("--max-new-tokens", type=int, default=256)
+    p.add_argument("--bootstrap-samples", type=int, default=1000)
+    p.add_argument("--seed", type=int, default=0)
+
+    p = sub.add_parser("release-check")
+    p.add_argument("--report", required=True, help="4-bit Dutch evaluation report JSON")
+    p.add_argument("--compact-report", default=None, help="Compact-export evaluation report JSON")
+    p.add_argument("--english-baseline", default=None, help="Base English evaluation report JSON")
+    p.add_argument("--english-tuned", default=None, help="Tuned English evaluation report JSON")
+    p.add_argument("--second-seed", default=None, help="Second-seed Dutch evaluation report JSON")
 
     p = sub.add_parser("generate-data")
     p.add_argument("--tools", type=str, default=None, help="Tool schemas JSON to seed generation")
@@ -199,6 +274,65 @@ def main():
     elif args.command == "finetune":
         from .model.finetune import finetune_local
         finetune_local(args)
+    elif args.command == "dutch-data":
+        from .dutch import create_dutch_dataset
+        outputs = create_dutch_dataset(
+            args.massive, args.output_dir, massive_en_path=args.massive_en,
+            seed=args.seed, action_count=args.action_count,
+            extraction_count=args.extraction_count, negative_count=args.negative_count,
+            multi_count=args.multi_count, english_count=args.english_count,
+            augmentation_count=args.augmentation_count,
+        )
+        for name, path in outputs.items():
+            print(f"  {name:<12}{path}")
+    elif args.command == "dutch-augment":
+        from .dutch import augment_training_file
+        manifest = augment_training_file(args.input, args.output, count=args.count, seed=args.seed)
+        print(__import__("json").dumps(manifest, ensure_ascii=False, indent=2))
+    elif args.command == "validate-data":
+        from .dutch import validate_many_jsonl
+        report = validate_many_jsonl(args.jsonl_paths, require_grounding=args.require_grounding)
+        if args.max_len:
+            from .model.finetune import rendered_length_report
+            reports = [rendered_length_report(path, args.max_len) for path in args.jsonl_paths]
+            report["token_lengths"] = reports
+            if args.fail_on_truncation:
+                report["invalid_examples"] += sum(item["over_limit"] for item in reports)
+        payload = __import__("json").dumps(report, ensure_ascii=False, indent=2)
+        if args.report:
+            with open(args.report, "w", encoding="utf-8") as handle:
+                handle.write(payload + "\n")
+        print(payload)
+        if report["invalid_examples"] or report["leakage_examples"]:
+            raise SystemExit(1)
+    elif args.command == "evaluate":
+        from .dutch import evaluate_runtime
+        report = evaluate_runtime(
+            args.jsonl_path, weights=args.weights, limit=args.limit,
+            max_new_tokens=args.max_new_tokens, bootstrap_samples=args.bootstrap_samples,
+            seed=args.seed,
+        )
+        payload = __import__("json").dumps(report, ensure_ascii=False, indent=2)
+        if args.report:
+            with open(args.report, "w", encoding="utf-8") as handle:
+                handle.write(payload + "\n")
+        print(payload)
+    elif args.command == "release-check":
+        from .dutch import release_gates
+
+        def load_report(path):
+            if not path:
+                return None
+            with open(path, encoding="utf-8") as handle:
+                return __import__("json").load(handle)
+
+        result = release_gates(load_report(args.report), compact_report=load_report(args.compact_report),
+                               english_baseline=load_report(args.english_baseline),
+                               english_tuned=load_report(args.english_tuned),
+                               second_seed=load_report(args.second_seed))
+        print(__import__("json").dumps(result, ensure_ascii=False, indent=2))
+        if not result["passed"]:
+            raise SystemExit(1)
     elif args.command == "generate-data":
         from .model.finetune import generate_main
         generate_main(args)
@@ -247,3 +381,7 @@ def main():
     elif args.command == "playground":
         from .playground.server import main as playground_main
         playground_main(args)
+
+
+if __name__ == "__main__":
+    main()

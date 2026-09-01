@@ -1,7 +1,12 @@
 import concurrent.futures
+import hashlib
+import importlib.metadata
+import inspect
 import json
 import os
 import pickle
+import platform
+import subprocess
 import sys
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -217,8 +222,8 @@ def _encode(tokenizer, example, max_len):
     return ids + [PAD_ID] * pad, mask + [0.0] * pad
 
 
-def fit_max_len(path, tokenizer, cap):
-    longest = 0
+def _rendered_lengths(path, tokenizer):
+    lengths = []
     with open(path) as handle:
         for line in handle:
             line = line.strip()
@@ -228,7 +233,25 @@ def fit_max_len(path, tokenizer, cap):
             if "query" not in example:
                 continue
             prompt, target = render_example(example)
-            longest = max(longest, len(tokenizer.encode(prompt)) + len(tokenizer.encode(target)) + 2)
+            lengths.append(len(tokenizer.encode(prompt)) + len(tokenizer.encode(target)) + 2)
+    return lengths
+
+
+def rendered_length_report(path, cap, tokenizer=None):
+    """Return deployment-relevant rendered token statistics without truncating."""
+    tokenizer = tokenizer or get_tokenizer()
+    lengths = _rendered_lengths(path, tokenizer)
+    return {
+        "path": str(path), "examples": len(lengths), "max_len": max(lengths, default=0),
+        "mean_len": float(np.mean(lengths)) if lengths else 0.0,
+        "over_limit": sum(length > cap for length in lengths), "cap": cap,
+    }
+
+
+def fit_max_len(path, tokenizer, cap):
+    longest = 0
+    for length in _rendered_lengths(path, tokenizer):
+        longest = max(longest, length)
     bucket = 128
     while bucket < min(longest, cap):
         bucket *= 2
@@ -291,10 +314,101 @@ def merge_lora(params, lora, scale):
     return unflatten_dict(flat)
 
 
+def _sha256(path):
+    if not path or not os.path.exists(path):
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _git_revision():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _package_versions():
+    names = ("cactus-needle", "jax", "jaxlib", "flax", "optax", "numpy")
+    versions = {}
+    for name in names:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+def _serialize_lora(lora):
+    return {"/".join(path): {"A": np.asarray(value["A"]), "B": np.asarray(value["B"])}
+            for path, value in lora.items()}
+
+
+def _restore_lora(serialized):
+    import jax.numpy as jnp
+    return {tuple(key.split("/")): {"A": jnp.asarray(value["A"]), "B": jnp.asarray(value["B"])}
+            for key, value in serialized.items()}
+
+
+def _write_adapter(path, lora, scale, base_path, rank, metadata):
+    with open(path, "wb") as handle:
+        pickle.dump({
+            "lora": _serialize_lora(lora), "scale": float(scale), "base": base_path,
+            "rank": rank, "metadata": metadata,
+        }, handle)
+
+
+def _patch_flax_debug_info(jax):
+    """Bridge Flax's legacy debug_info call to newer JAX releases.
+
+    JAX 0.4.38 (the version required by jax-metal) moved ``debug_info`` out of
+    the public ``jax.api_util`` module and changed its signature. Flax 0.10.x
+    still calls the old four-argument API from ``axes_scan``. Keep this shim
+    local to fine-tuning so importing or serving Needle remains untouched.
+    """
+    if not hasattr(jax.api_util, "debug_info"):
+        try:
+            from jax._src import api_util as private_api_util
+        except ImportError:
+            private_api_util = None
+        if private_api_util is not None:
+            legacy = private_api_util.debug_info
+
+            def compat(traced_for, fun, args, kwargs):
+                try:
+                    signature = inspect.signature(fun)
+                except (TypeError, ValueError):
+                    signature = None
+                return legacy(traced_for, None, signature, args, kwargs, (), ())
+
+            jax.api_util.debug_info = compat
+
+    # The same JAX release removed the ``debug_info=`` keyword accepted by
+    # Flax's ``linear_util.wrap_init`` call.  Preserve the old keyword and
+    # discard it; debug metadata is non-functional for the training result.
+    try:
+        from jax.extend import linear_util
+        if "debug_info" not in inspect.signature(linear_util.wrap_init).parameters:
+            original_wrap_init = linear_util.wrap_init
+
+            def wrap_init_compat(fun, params=None, **kwargs):
+                return original_wrap_init(fun, params)
+
+            linear_util.wrap_init = wrap_init_compat
+    except (ImportError, TypeError, ValueError):
+        pass
+
+
 def finetune_local(args, progress=None):
     import jax
     import jax.numpy as jnp
     import optax
+    _patch_flax_debug_info(jax)
     from .run import load_checkpoint
     from .architecture import SimpleAttentionNetwork
 
@@ -304,23 +418,39 @@ def finetune_local(args, progress=None):
             progress(msg)
 
     base_path = args.checkpoint or DEFAULT_BASE
-    data_path = args.jsonl_path
+    data_path = getattr(args, "train_file", None) or args.jsonl_path
+    val_path = getattr(args, "val_file", None)
+    seed = getattr(args, "seed", 0)
     if getattr(args, "generate", 0):
         data_path = augment_jsonl(data_path, args.generate, model=getattr(args, "model", None),
                                   workers=getattr(args, "workers", 8))
+        if val_path:
+            emit("  note     generated examples are added to train data only")
 
     params, config = load_checkpoint(base_path)
     config.dtype = "float32"
     params = jax.tree.map(lambda a: np.asarray(a).astype(np.float32), params)
     backend = jax.default_backend().lower()
     if backend == "metal":
-        config.flash = False
+        # Manual GQA attention is the conservative Metal path.  Some newer
+        # jax-metal builds can lower dot_product_attention, so expose an
+        # opt-in for benchmarking without making it the default stable path.
+        config.flash = os.environ.get("NEEDLE_METAL_FLASH", "0") == "1"
         config.remat = False
         config.scan_unroll = config.num_layers
     params = jax.device_put(params)
     emit(f"  {'backend':<9} {backend}  float32")
     tokenizer = get_tokenizer(config.vocab_size)
-    max_len = fit_max_len(data_path, tokenizer, args.max_len)
+    cap = args.max_len
+    length_paths = [data_path] + ([val_path] if val_path else [])
+    length_reports = [rendered_length_report(path, cap, tokenizer) for path in length_paths]
+    over_limit = sum(report["over_limit"] for report in length_reports)
+    for report in length_reports:
+        emit(f"  {'tokens':<9} {os.path.basename(report['path'])}  max {report['max_len']} "
+             f"mean {report['mean_len']:.1f}  over {report['over_limit']}/{report['cap']}")
+    if over_limit and getattr(args, "fail_on_truncation", False):
+        raise SystemExit(f"{over_limit} examples exceed --max-len {cap}; shorten or remove them")
+    max_len = max(fit_max_len(path, tokenizer, cap) for path in length_paths)
     seqs, masks = load_jsonl(data_path, tokenizer, max_len)
     if len(seqs) == 0:
         raise SystemExit("no usable examples in " + data_path)
@@ -329,73 +459,209 @@ def finetune_local(args, progress=None):
     model = SimpleAttentionNetwork(config)
     paths = lora_target_paths(params)
     scale = args.lora_alpha / args.lora_rank
-    lora = init_lora(params, paths, args.lora_rank, jax.random.PRNGKey(0))
+    lora = init_lora(params, paths, args.lora_rank, jax.random.PRNGKey(seed))
     emit(f"  {'lora':<9} rank {args.lora_rank}  alpha {args.lora_alpha:g}  {len(paths)} weight groups")
 
-    n_val = min(int(len(seqs) * getattr(args, "val_split", 0.1)), len(seqs) - 1)
-    if n_val > 0:
-        order = np.random.default_rng(0).permutation(len(seqs))
-        seqs, masks = seqs[order], masks[order]
-        val_seqs, val_masks = seqs[:n_val], masks[:n_val]
-        seqs, masks = seqs[n_val:], masks[n_val:]
-        emit(f"  {'holdout':<9} {n_val} examples for validation")
+    if val_path:
+        val_seqs, val_masks = load_jsonl(val_path, tokenizer, max_len)
+        n_val = len(val_seqs)
+        emit(f"  {'validation':<9} {n_val} explicit grouped examples")
+    else:
+        n_val = min(int(len(seqs) * getattr(args, "val_split", 0.1)), len(seqs) - 1)
+        if n_val > 0:
+            order = np.random.default_rng(seed).permutation(len(seqs))
+            seqs, masks = seqs[order], masks[order]
+            val_seqs, val_masks = seqs[:n_val], masks[:n_val]
+            seqs, masks = seqs[n_val:], masks[n_val:]
+            emit(f"  {'holdout':<9} {n_val} examples for validation (prefer --val-file)")
+        else:
+            val_seqs = val_masks = None
 
     batch, count = args.batch_size, len(seqs)
-    steps_per_epoch = -(-count // batch)
-    total_steps = args.epochs * steps_per_epoch
-    warmup = min(max(1, total_steps // 20), total_steps - 1)
+    accum_steps = max(1, getattr(args, "grad_accum_steps", 1))
+    micro_steps_per_epoch = -(-count // batch)
+    steps_per_epoch = -(-micro_steps_per_epoch // accum_steps)
+    requested_steps = getattr(args, "max_steps", 0)
+    total_steps = requested_steps or args.epochs * steps_per_epoch
+    epoch_limit = (max(args.epochs, -(-total_steps // steps_per_epoch))
+                   if requested_steps else args.epochs)
+    warmup = min(max(1, total_steps // 20), max(1, total_steps - 1))
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0, peak_value=args.lr,
-        warmup_steps=warmup, decay_steps=total_steps)
+        warmup_steps=warmup, decay_steps=max(total_steps, warmup + 1))
     optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(schedule))
     opt_state = optimizer.init(lora)
-    emit(f"  {'schedule':<9} {total_steps} steps  warmup {warmup}  cosine decay  clip 1.0  (compiling...)")
+    emit(f"  {'schedule':<9} {total_steps} updates  warmup {warmup}  cosine decay  clip 1.0 "
+         f"microbatch {batch} x accumulation {accum_steps}  (compiling...)")
 
-    def loss_fn(lora, ids, mask):
+    def loss_sum_fn(lora, ids, mask):
         logits = model.apply({"params": merge_lora(params, lora, scale)}, ids)
         logits, targets, mask = logits[:, :-1], ids[:, 1:], mask[:, 1:]
         ce = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
-        return (ce * mask).sum() / jnp.maximum(mask.sum(), 1.0)
+        return (ce * mask).sum(), mask.sum()
 
     @jax.jit
-    def train_step(lora, opt_state, ids, mask):
-        loss, grads = jax.value_and_grad(loss_fn)(lora, ids, mask)
+    def grad_step(lora, ids, mask):
+        (loss_sum, token_count), grads = jax.value_and_grad(loss_sum_fn, has_aux=True)(lora, ids, mask)
+        return grads, loss_sum, token_count
+
+    @jax.jit
+    def apply_step(lora, opt_state, grads):
         updates, opt_state = optimizer.update(grads, opt_state, lora)
-        return optax.apply_updates(lora, updates), opt_state, loss
-
-    eval_step = jax.jit(loss_fn)
-
-    every = max(1, total_steps // 50)
-    step_i = 0
-    for epoch in range(args.epochs):
-        order = np.random.permutation(count)
-        last = 0.0
-        for start in range(0, count, batch):
-            idx = order[start:start + batch]
-            lora, opt_state, loss = train_step(lora, opt_state,
-                                               jnp.asarray(seqs[idx]), jnp.asarray(masks[idx]))
-            last = float(loss)
-            step_i += 1
-            if step_i % every == 0:
-                emit(f"  {'step':<9} {step_i}/{total_steps}  loss {last:.4f}")
-        if n_val > 0:
-            val = np.mean([float(eval_step(lora, jnp.asarray(val_seqs[i:i + batch]),
-                                           jnp.asarray(val_masks[i:i + batch])))
-                           for i in range(0, n_val, batch)])
-            emit(f"  {'epoch':<9} {epoch + 1}/{args.epochs}  loss {last:.4f}  val {val:.4f}")
-        else:
-            emit(f"  {'epoch':<9} {epoch + 1}/{args.epochs}  loss {last:.4f}")
+        return optax.apply_updates(lora, updates), opt_state
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    metadata = {
+        "train_sha256": _sha256(data_path), "val_sha256": _sha256(val_path),
+        "base_sha256": _sha256(base_path), "seed": seed, "backend": backend,
+        "platform": platform.platform(), "git_revision": _git_revision(),
+        "package_versions": _package_versions(),
+        "config": {"lr": args.lr, "lora_rank": args.lora_rank,
+                   "lora_alpha": args.lora_alpha, "max_len": max_len,
+                   "microbatch": batch, "grad_accum_steps": accum_steps},
+    }
+    resume_signature = {
+        "train_sha256": metadata["train_sha256"], "val_sha256": metadata["val_sha256"],
+        "base_sha256": metadata["base_sha256"], "lr": args.lr,
+        "lora_rank": args.lora_rank, "lora_alpha": args.lora_alpha,
+        "max_len": max_len, "microbatch": batch, "grad_accum_steps": accum_steps,
+        "selection_metric": getattr(args, "selection_metric", "val_loss"),
+    }
+    start_epoch = 0
+    resume_start = 0
+    step_i = 0
+    best_val = float("inf")
+    best_score = float("-inf")
+    best_lora = _serialize_lora(lora)
+    no_improvement = 0
+    resume_path = getattr(args, "resume", None)
+    if resume_path:
+        with open(resume_path, "rb") as handle:
+            state = pickle.load(handle)
+        if state.get("base") != base_path or state.get("rank") != args.lora_rank:
+            raise ValueError("resume state does not match base checkpoint or LoRA rank")
+        if state.get("resume_signature") != resume_signature:
+            raise ValueError("resume state does not match the dataset or optimizer configuration")
+        lora = _restore_lora(state["lora"])
+        opt_state = jax.tree.map(jnp.asarray, state["opt_state"])
+        start_epoch = int(state.get("next_epoch", int(state.get("epoch", -1)) + 1))
+        resume_start = int(state.get("next_start", 0))
+        step_i = int(state.get("step", 0))
+        best_val = float(state.get("best_val", best_val))
+        best_score = float(state.get("best_score", -best_val))
+        best_lora = state.get("best_lora", best_lora)
+        no_improvement = int(state.get("no_improvement", 0))
+        emit(f"  {'resume':<9} {resume_path}  step {step_i}  epoch {start_epoch + 1} "
+             f"offset {resume_start}")
+
+    eval_loss_sum = jax.jit(loss_sum_fn)
+    eval_every = getattr(args, "eval_every", 0) or steps_per_epoch
+    patience = getattr(args, "early_stopping_patience", 0)
+    selection_metric = getattr(args, "selection_metric", "val_loss")
+
+    def runtime_exact_score():
+        """Score a temporary export through deployed constrained decoding."""
+        from .architecture import effective_kv_window
+        from .export import write_export
+        from needle.dutch import evaluate_runtime
+
+        archive = os.path.join(args.checkpoint_dir, f".needle_runtime_eval_{step_i}.cact")
+        merged = merge_lora(params, lora, scale)
+        write_export(merged, config, archive, bits=4, tokenizer=tokenizer,
+                     kv_window=effective_kv_window(config))
+        try:
+            report = evaluate_runtime(val_path, weights=archive, bootstrap_samples=0, seed=seed)
+            return report["exact_call_accuracy"], report
+        finally:
+            try:
+                os.remove(archive)
+            except FileNotFoundError:
+                pass
+
+    def evaluate_and_checkpoint(next_epoch, next_start, last_loss):
+        nonlocal best_val, best_score, best_lora, no_improvement
+        val = None
+        runtime = None
+        if n_val > 0:
+            total_loss, total_tokens = 0.0, 0.0
+            for start in range(0, n_val, batch):
+                loss_sum, token_count = eval_loss_sum(
+                    lora, jnp.asarray(val_seqs[start:start + batch]),
+                    jnp.asarray(val_masks[start:start + batch]))
+                total_loss += float(loss_sum)
+                total_tokens += float(token_count)
+            val = total_loss / max(total_tokens, 1.0)
+            if selection_metric == "runtime_exact":
+                if not val_path:
+                    raise ValueError("--selection-metric runtime_exact requires --val-file")
+                score, runtime = runtime_exact_score()
+            else:
+                score = -val
+            if score > best_score:
+                best_val, best_score, best_lora, no_improvement = val, score, _serialize_lora(lora), 0
+                _write_adapter(os.path.join(args.checkpoint_dir, "needle_lora_best.pkl"), lora,
+                               scale, base_path, args.lora_rank,
+                               {**metadata, "step": step_i, "validation_loss": val,
+                                "selection_metric": selection_metric, "selection_score": score,
+                                "runtime_evaluation": runtime})
+            else:
+                no_improvement += 1
+        _write_adapter(os.path.join(args.checkpoint_dir, f"needle_lora_step_{step_i}.pkl"), lora,
+                       scale, base_path, args.lora_rank,
+                       {**metadata, "step": step_i, "validation_loss": val})
+        state_path = os.path.join(args.checkpoint_dir, "needle_training_state.pkl")
+        with open(state_path, "wb") as handle:
+            pickle.dump({
+                "lora": _serialize_lora(lora), "opt_state": jax.tree.map(np.asarray, opt_state),
+                "base": base_path, "rank": args.lora_rank,
+                "next_epoch": next_epoch, "next_start": next_start, "step": step_i,
+                "best_val": best_val, "best_score": best_score, "best_lora": best_lora,
+                "no_improvement": no_improvement, "resume_signature": resume_signature,
+            }, handle)
+        suffix = f"  val {val:.4f}" if val is not None else ""
+        if runtime is not None:
+            suffix += f"  exact {runtime['exact_call_accuracy']:.4f}"
+        emit(f"  {'checkpoint':<9} next epoch {next_epoch + 1}  step {step_i}  loss {last_loss:.4f}{suffix}")
+        return bool(patience and n_val and no_improvement >= patience)
+
+    should_stop = False
+    last = 0.0
+    for epoch in range(start_epoch, epoch_limit):
+        order = np.random.default_rng(seed + epoch).permutation(count)
+        grad_sum = None
+        token_sum = 0.0
+        micro_count = 0
+        checkpoint_epoch, checkpoint_start = epoch, resume_start if epoch == start_epoch else 0
+        for start in range(checkpoint_start, count, batch):
+            idx = order[start:start + batch]
+            grads, loss_sum, token_count = grad_step(lora, jnp.asarray(seqs[idx]), jnp.asarray(masks[idx]))
+            grad_sum = grads if grad_sum is None else jax.tree.map(lambda left, right: left + right, grad_sum, grads)
+            token_sum += float(token_count)
+            micro_count += 1
+            if micro_count < accum_steps and start + batch < count:
+                continue
+            grads = jax.tree.map(lambda value: value / max(token_sum, 1.0), grad_sum)
+            lora, opt_state = apply_step(lora, opt_state, grads)
+            last = float(loss_sum) / max(float(token_count), 1.0)
+            step_i += 1
+            grad_sum, token_sum, micro_count = None, 0.0, 0
+            checkpoint_epoch, checkpoint_start = (epoch + 1, 0) if start + batch >= count else (epoch, start + batch)
+            if step_i % eval_every == 0:
+                should_stop = evaluate_and_checkpoint(checkpoint_epoch, checkpoint_start, last)
+            if step_i >= total_steps or should_stop:
+                break
+        if step_i % eval_every != 0:
+            should_stop = evaluate_and_checkpoint(checkpoint_epoch, checkpoint_start, last) or should_stop
+        if should_stop or step_i >= total_steps:
+            break
+        resume_start = 0
+
     out = args.out or os.path.join(args.checkpoint_dir, "needle_lora.pkl")
-    with open(out, "wb") as handle:
-        pickle.dump({
-            "lora": {"/".join(p): {"A": np.asarray(v["A"]), "B": np.asarray(v["B"])}
-                     for p, v in lora.items()},
-            "scale": float(scale),
-            "base": base_path,
-            "rank": args.lora_rank,
-        }, handle)
+    selected_lora = _restore_lora(best_lora) if n_val else lora
+    _write_adapter(out, selected_lora, scale, base_path, args.lora_rank,
+                   {**metadata, "step": step_i, "validation_loss": best_val if n_val else None,
+                    "selected_by": selection_metric if n_val else "final_step",
+                    "selection_score": best_score if n_val else None})
     print(f"  {'adapter':<9} {out}")
     print(f"  {'next':<9} needle build {base_path} --lora {out}")
     print(f"  {'note':<9} confidence reports None with tuned weights; the head is not tuned")
