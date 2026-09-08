@@ -95,3 +95,5 @@ needle-ui.*
 *.vocab 
 *.model
 *.cact
+
+results

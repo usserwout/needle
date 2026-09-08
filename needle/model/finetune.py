@@ -8,6 +8,7 @@ import pickle
 import platform
 import subprocess
 import sys
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -27,6 +28,20 @@ from .tokenizer import (
 
 LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "gate_proj", "out_proj")
 DEFAULT_BASE = "checkpoints/needle2.pkl"
+
+
+def _format_duration(seconds):
+    """Format a duration for human-readable training progress messages."""
+    if seconds is None or not np.isfinite(seconds):
+        return "unknown"
+    seconds = max(0, int(round(seconds)))
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
 
 OPENROUTER_URL = os.environ.get(
     "OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions"
@@ -491,8 +506,12 @@ def finetune_local(args, progress=None):
         warmup_steps=warmup, decay_steps=max(total_steps, warmup + 1))
     optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(schedule))
     opt_state = optimizer.init(lora)
+    progress_every = max(1, int(getattr(args, "progress_every", 25)))
+    training_started = time.perf_counter()
     emit(f"  {'schedule':<9} {total_steps} updates  warmup {warmup}  cosine decay  clip 1.0 "
-         f"microbatch {batch} x accumulation {accum_steps}  (compiling...)")
+         f"microbatch {batch} x accumulation {accum_steps}")
+    emit(f"  {'progress':<9} every {progress_every} updates  first update includes JAX compilation; "
+         f"ETA starts after compilation")
 
     def loss_sum_fn(lora, ids, mask):
         logits = model.apply({"params": merge_lora(params, lora, scale)}, ids)
@@ -558,6 +577,8 @@ def finetune_local(args, progress=None):
     eval_every = getattr(args, "eval_every", 0) or steps_per_epoch
     patience = getattr(args, "early_stopping_patience", 0)
     selection_metric = getattr(args, "selection_metric", "val_loss")
+    progress_start_step = step_i
+    first_update_finished = None
 
     def runtime_exact_score():
         """Score a temporary export through deployed constrained decoding."""
@@ -580,6 +601,9 @@ def finetune_local(args, progress=None):
 
     def evaluate_and_checkpoint(next_epoch, next_start, last_loss):
         nonlocal best_val, best_score, best_lora, no_improvement
+        evaluation_started = time.perf_counter()
+        emit(f"  {'evaluation':<9} starting at update {step_i}/{total_steps} "
+             f"(every {eval_every}; {max(0, total_steps - step_i)} updates remaining)")
         val = None
         runtime = None
         if n_val > 0:
@@ -621,7 +645,10 @@ def finetune_local(args, progress=None):
         suffix = f"  val {val:.4f}" if val is not None else ""
         if runtime is not None:
             suffix += f"  exact {runtime['exact_call_accuracy']:.4f}"
-        emit(f"  {'checkpoint':<9} next epoch {next_epoch + 1}  step {step_i}  loss {last_loss:.4f}{suffix}")
+        eval_elapsed = _format_duration(time.perf_counter() - evaluation_started)
+        total_elapsed = _format_duration(time.perf_counter() - training_started)
+        emit(f"  {'checkpoint':<9} next epoch {next_epoch + 1}  step {step_i}  loss {last_loss:.4f}"
+             f"{suffix}  eval {eval_elapsed}  elapsed {total_elapsed}")
         return bool(patience and n_val and no_improvement >= patience)
 
     should_stop = False
@@ -645,6 +672,26 @@ def finetune_local(args, progress=None):
             last = float(loss_sum) / max(float(token_count), 1.0)
             step_i += 1
             grad_sum, token_sum, micro_count = None, 0.0, 0
+            now = time.perf_counter()
+            if first_update_finished is None:
+                first_update_finished = now
+                emit(f"  {'compiled':<9} first update finished in "
+                     f"{_format_duration(now - training_started)}; progress timing started")
+            updates_this_run = step_i - progress_start_step
+            if (updates_this_run == 1 or updates_this_run % progress_every == 0 or
+                    step_i >= total_steps):
+                timed_elapsed = max(now - first_update_finished, 1e-9)
+                rate = max(0.0, updates_this_run - 1) / timed_elapsed
+                remaining = max(0, total_steps - step_i)
+                eta = remaining / rate if rate > 0 else None
+                next_eval = eval_every - (step_i % eval_every)
+                if next_eval == eval_every and step_i % eval_every == 0:
+                    next_eval = 0
+                emit(f"  {'progress':<9} update {step_i}/{total_steps} "
+                     f"({100.0 * step_i / max(total_steps, 1):.1f}%)  loss {last:.4f}  "
+                     f"rate {rate:.2f} upd/s  ETA {_format_duration(eta)}  "
+                     f"elapsed {_format_duration(now - training_started)}  "
+                     f"next eval {next_eval if next_eval else 'now'}")
             checkpoint_epoch, checkpoint_start = (epoch + 1, 0) if start + batch >= count else (epoch, start + batch)
             if step_i % eval_every == 0:
                 should_stop = evaluate_and_checkpoint(checkpoint_epoch, checkpoint_start, last)
@@ -662,6 +709,8 @@ def finetune_local(args, progress=None):
                    {**metadata, "step": step_i, "validation_loss": best_val if n_val else None,
                     "selected_by": selection_metric if n_val else "final_step",
                     "selection_score": best_score if n_val else None})
+    total_elapsed = _format_duration(time.perf_counter() - training_started)
+    emit(f"  {'complete':<9} updates {step_i}/{total_steps}  elapsed {total_elapsed}")
     print(f"  {'adapter':<9} {out}")
     print(f"  {'next':<9} needle build {base_path} --lora {out}")
     print(f"  {'note':<9} confidence reports None with tuned weights; the head is not tuned")

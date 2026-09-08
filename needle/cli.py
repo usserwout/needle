@@ -155,6 +155,8 @@ def main():
                    help="Accumulate this many microbatches per optimizer update")
     p.add_argument("--eval-every", type=int, default=0,
                    help="Evaluate every N optimizer updates (0 evaluates each epoch)")
+    p.add_argument("--progress-every", type=int, default=25,
+                   help="Print throughput and ETA every N optimizer updates (default: 25)")
     p.add_argument("--early-stopping-patience", type=int, default=0,
                    help="Stop after N non-improving validations (0 disables)")
     p.add_argument("--selection-metric", choices=["runtime_exact", "val_loss"],

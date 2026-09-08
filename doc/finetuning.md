@@ -186,6 +186,8 @@ Step count is what small datasets get wrong. 200 examples at batch 16 is 13 step
 
 A validation loss prints at each epoch end (10 percent of examples are held out by default, `--val-split` to change). When it rises while the training loss keeps falling, the run is overfitting: stop there, or add data.
 
+Training also prints a progress line every 25 optimizer updates by default. It reports the update count and percentage, loss, updates per second, elapsed time, estimated time remaining, and distance to the next evaluation. The first update includes JAX compilation and is reported separately, so the ETA is only meaningful after compilation completes. Change the cadence with `--progress-every 10` (or a larger value for less output). Evaluation and checkpoint lines include their own duration and total elapsed time.
+
 ## Sizing the dataset
 
 Tool selection moves first: a few hundred clean examples measurably improve which tool gets picked. Argument grounding moves later and needs more data, on the order of thousands of examples, with reasoning lines and varied phrasings and values. If evaluation shows correct tools with wrong argument values, the dataset is too small or too uniform, not mislabeled. For grounding heavy tasks `--lora-rank 32` doubles adapter capacity and the adapter stays tiny.
